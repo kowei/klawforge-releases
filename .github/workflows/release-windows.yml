@@ -1,0 +1,230 @@
+name: Build — Windows (arm64 + x64, public CI)
+
+# 在「公開」channel repo (kowei/klawforge-releases) 跑 Windows build。
+# 為什麼在這:public repo → GitHub Actions 免費無限分鐘 + 完整 hosted runner 艦隊
+#   (含免費 windows-11-arm,private OpenKlaw 拿不到 / 要燒分鐘)。
+#   源碼在私有 kowei/OpenKlaw → 用 OPENKLAW_TOKEN checkout。
+#   成品就地發在本 repo(同 repo,publish 用內建 GITHUB_TOKEN,免跨 repo PAT)。
+#   ⚠️ public repo 的 Actions log 公開(KC 2026-06-12 接受:編譯細節非 moat)。
+#   對照 macOS 走 OpenKlaw self-hosted release-macos.yml(Developer-ID + $0,log 私有)。
+#
+# 觸發:workflow_dispatch(手動)。inputs:
+#   - source_ref:要 build 的 OpenKlaw git ref(tag/branch/sha),預設 main。
+#   - 版本由 checkout 後的 clients/desktop/package.json 推導 → release tag = v<version>。
+#   (tag 觸發不適用:tag 在 OpenKlaw,不在本 repo。Windows release 不頻繁,手動 dispatch 夠。)
+#
+# 需要的 repo secrets(本 repo Settings → Secrets → Actions):
+#   - OPENKLAW_TOKEN            ← fine-grained PAT,對 kowei/OpenKlaw 有 Contents:read(必填)
+#   - TAURI_SIGNING_PRIVATE_KEY ← Mac ~/.config/klawforge/updater.key 內容(選填;沒有 = unsigned dogfood)
+#   - TAURI_SIGNING_PRIVATE_KEY_PASSWORD ← 同上 .password(選填)
+#
+# signing 可選:有 TAURI_SIGNING_PRIVATE_KEY → 產 -setup.exe + .sig + merge latest.json(線上更新);
+#              沒有 → unsigned -setup.exe(手動裝 dogfood 可,線上更新待補簽章)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'OpenKlaw git ref to build (tag / branch / sha)'
+        required: true
+        default: 'main'
+
+permissions:
+  contents: write   # 同 repo 發 release
+
+concurrency:
+  group: windows-build-${{ github.event.inputs.source_ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.arch }} nsis
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+            triple: x86_64-pc-windows-msvc
+            sidecar_arch: x86_64
+          - arch: arm64
+            runner: windows-11-arm
+            triple: aarch64-pc-windows-msvc
+            sidecar_arch: aarch64
+    env:
+      VITE_KLAWFORGE_DEV: '1'
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+    steps:
+      # 跨 repo:checkout 私有 OpenKlaw 源(非本 channel repo)。
+      - name: Checkout OpenKlaw source @ ${{ github.event.inputs.source_ref }}
+        uses: actions/checkout@v4
+        with:
+          repository: kowei/OpenKlaw
+          ref: ${{ github.event.inputs.source_ref }}
+          token: ${{ secrets.OPENKLAW_TOKEN }}
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Setup Go 1.26 (sidecar build)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Setup Rust (+ target ${{ matrix.triple }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      # ring(reqwest→rustls)在 windows-msvc 編 asm 需 clang;沒有就 choco 補。
+      - name: Ensure clang on PATH (ring build)
+        shell: pwsh
+        run: |
+          $llvm = "C:\Program Files\LLVM\bin"
+          if (-not (Test-Path "$llvm\clang.exe")) { choco install llvm -y --no-progress }
+          Add-Content -Path $env:GITHUB_PATH -Value $llvm
+          & "$llvm\clang.exe" --version
+
+      - name: Detect signing mode
+        id: sign
+        shell: bash
+        run: |
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY}" ]; then
+            echo "signed=true"  >> "$GITHUB_OUTPUT"; echo "✓ signing key present → signed updater"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"; echo "⚠ no signing key → unsigned dogfood build"
+          fi
+
+      - name: Install JS deps (npm workspace)
+        run: npm ci
+
+      # 防 npm optional-deps bug(該 arch native binding 可能沒被裝)。
+      - name: Ensure tauri CLI native binding (win32-${{ matrix.arch }}-msvc)
+        working-directory: clients/desktop
+        shell: bash
+        run: |
+          if ! node -e "require('@tauri-apps/cli')" 2>/dev/null; then
+            ver="$(node -p "require('@tauri-apps/cli/package.json').version")"
+            npm install --no-save "@tauri-apps/cli-win32-${{ matrix.arch }}-msvc@${ver}"
+          fi
+
+      - name: Build Go sidecars (${{ matrix.sidecar_arch }})
+        shell: bash
+        run: bash scripts/build-windows-sidecars.sh ${{ matrix.sidecar_arch }}
+
+      - name: Build Rust sidecars (${{ matrix.triple }})
+        shell: bash
+        run: |
+          t="${{ matrix.triple }}"
+          cargo build --release --manifest-path clients/desktop/src-capture/Cargo.toml --target "$t"
+          cargo build --release --manifest-path clients/desktop/src-shim/Cargo.toml    --target "$t"
+          bin="clients/desktop/src-tauri/src-tauri/binaries"
+          cp "clients/desktop/src-capture/target/$t/release/klawforge-capture.exe" "$bin/klawforge-capture-$t.exe"
+          cp "clients/desktop/src-shim/target/$t/release/klawforge-mcp-shim.exe"   "$bin/klawforge-mcp-shim-$t.exe"
+          ls -la "$bin"/*-"$t".exe
+
+      # signed:走 tauri.conf.json 預設 createUpdaterArtifacts → 產 -setup.exe + .sig
+      - name: Tauri build (signed nsis, ${{ matrix.arch }})
+        if: steps.sign.outputs.signed == 'true'
+        working-directory: clients/desktop
+        shell: bash
+        run: npx tauri build --target ${{ matrix.triple }} --features dev-license,compute-helper --bundles nsis
+
+      # unsigned:關 createUpdaterArtifacts(免簽章金鑰),只出 -setup.exe
+      - name: Tauri build (unsigned nsis, ${{ matrix.arch }})
+        if: steps.sign.outputs.signed == 'false'
+        working-directory: clients/desktop
+        shell: bash
+        run: npx tauri build --target ${{ matrix.triple }} --features dev-license,compute-helper --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          ver="$(node -p "require('./clients/desktop/package.json').version")"
+          src="clients/desktop/src-tauri/src-tauri/target/${{ matrix.triple }}/release/bundle/nsis"
+          exe="$(ls "$src"/Klawforge_*_*-setup.exe)"
+          name="Klawforge-${ver}-windows-${{ matrix.arch }}-setup.exe"
+          mkdir -p staging
+          cp "$exe" "staging/$name"
+          if [ -f "$exe.sig" ]; then cp "$exe.sig" "staging/$name.sig"; fi
+          ( cd staging && sha256sum "$name" > "$name.sha256" )
+          echo "$ver" > staging/VERSION.txt
+          ls -la staging
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: klawforge-windows-${{ matrix.arch }}-nsis
+          path: staging/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish to this channel + merge latest.json
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}   # 同 repo,內建 token 即可發 release
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dl
+
+      - name: Collect + (if signed) merge latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY}"   # kowei/klawforge-releases(本 repo)
+          mkdir -p out
+          cp dl/klawforge-windows-x64-nsis/*   out/ 2>/dev/null || true
+          cp dl/klawforge-windows-arm64-nsis/* out/ 2>/dev/null || true
+          VER="$(cat out/VERSION.txt | head -1)"; rm -f out/VERSION.txt
+          TAG="v${VER}"
+          echo "VER=$VER" >> "$GITHUB_ENV"; echo "TAG=$TAG" >> "$GITHUB_ENV"
+          ls -la out
+
+          x64="Klawforge-${VER}-windows-x64-setup.exe"
+          arm="Klawforge-${VER}-windows-arm64-setup.exe"
+          urlbase="https://github.com/${REPO}/releases/download/${TAG}"
+
+          # 只有 signed(有 .sig)才動 latest.json 線上更新源;unsigned 跳過(手動裝)。
+          if [ -f "out/${x64}.sig" ] && [ -f "out/${arm}.sig" ]; then
+            if curl -fsSL "https://github.com/${REPO}/releases/latest/download/latest.json" -o cur.json; then
+              cur_ver="$(jq -r '.version // ""' cur.json)"
+              if [ "$cur_ver" = "$VER" ]; then keep=cur.json; else echo '{}' > keep.json; keep=keep.json; fi
+            else
+              echo '{}' > keep.json; keep=keep.json
+            fi
+            NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            jq --arg ver "$VER" --arg now "$NOW" \
+               --arg sx "$(cat "out/${x64}.sig")" --arg ux "${urlbase}/${x64}" \
+               --arg sa "$(cat "out/${arm}.sig")" --arg ua "${urlbase}/${arm}" \
+               '.version=$ver | .pub_date=$now
+                | .platforms = ((.platforms // {}) + {"windows-x86_64":{signature:$sx,url:$ux},"windows-aarch64":{signature:$sa,url:$ua}})' \
+               "$keep" > out/latest.json
+            echo "signed → latest.json platforms:"; jq -r '.platforms|keys[]' out/latest.json
+          else
+            echo "⚠ unsigned build → 不動 latest.json(線上更新需簽章)"
+          fi
+
+      - name: Publish to release ${{ env.TAG }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd out
+          shopt -s nullglob
+          assets=( Klawforge-*-windows-*-setup.exe Klawforge-*-windows-*-setup.exe.sig latest.json )
+          echo "發佈 → ${GITHUB_REPOSITORY} @ ${TAG}: ${assets[*]}"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
+          else
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "Klawforge ${VER}" --notes "Klawforge ${VER} (Windows)" "${assets[@]}"
+          fi
