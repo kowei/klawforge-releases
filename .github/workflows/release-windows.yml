@@ -156,6 +156,9 @@ jobs:
           if [ -f "$exe.sig" ]; then cp "$exe.sig" "staging/$name.sig"; fi
           ( cd staging && sha256sum "$name" > "$name.sha256" )
           echo "$ver" > staging/VERSION.txt
+          # release notes ← CHANGELOG 該版 section(與 mac make-release.sh 同源 changelog-extract.sh)
+          bash scripts/changelog-extract.sh "$ver" clients/desktop/CHANGELOG.md > staging/RELEASE_NOTES.md 2>/dev/null || true
+          [ -s staging/RELEASE_NOTES.md ] || echo "Klawforge $ver" > staging/RELEASE_NOTES.md
           ls -la staging
 
       - name: Upload workflow artifact
@@ -222,9 +225,13 @@ jobs:
           cd out
           shopt -s nullglob
           assets=( Klawforge-*-windows-*-setup.exe Klawforge-*-windows-*-setup.exe.sig latest.json )
+          notes_args=(--notes "Klawforge ${VER}")
+          [ -s RELEASE_NOTES.md ] && notes_args=(--notes-file RELEASE_NOTES.md)
           echo "發佈 → ${GITHUB_REPOSITORY} @ ${TAG}: ${assets[*]}"
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
+            # 用 CHANGELOG 刷新 notes(蓋過罐頭 / 他平台先建的 generic;changelog 為單一事實源)
+            [ -s RELEASE_NOTES.md ] && gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --notes-file RELEASE_NOTES.md
           else
-            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "Klawforge ${VER}" --notes "Klawforge ${VER} (Windows)" "${assets[@]}"
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "Klawforge ${VER}" "${notes_args[@]}" "${assets[@]}"
           fi
