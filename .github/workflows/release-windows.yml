@@ -130,6 +130,23 @@ jobs:
           cp "clients/desktop/src-shim/target/$t/release/klawforge-mcp-shim.exe"   "$bin/klawforge-mcp-shim-$t.exe"
           ls -la "$bin"/*-"$t".exe
 
+      # B 方案(BUG-EMBEDDER-WINDOWS-LLAMA-DLLS-001):抓 llama.cpp 官方 always-latest
+      # 真引擎(取代 WP-004 Go 空殼)。externalBin llama-server + tauri.windows.conf.json
+      # resource(llama-libs-win)都靠這步產出,缺它 Windows 語意 recall 死。
+      - name: Fetch llama-server engine (official llama.cpp, always-latest)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/fetch-llama-server.sh ${{ matrix.triple }}
+          bin="clients/desktop/src-tauri/src-tauri/binaries"
+          # 固定名給 tauri.windows.conf.json bundle(單 arch per build,DLL 同名不混 arch)
+          rm -rf "$bin/llama-libs-win"
+          cp -r "$bin/llama-libs-${{ matrix.triple }}" "$bin/llama-libs-win"
+          echo "=== 真引擎就位驗證(exe 應 ~9KB 薄啟動器,非 1.6MB Go 空殼)==="
+          ls -la "$bin/llama-server-${{ matrix.triple }}.exe"
+          ls "$bin/llama-libs-win" | head
+
       # signed:走 tauri.conf.json 預設 createUpdaterArtifacts → 產 -setup.exe + .sig
       - name: Tauri build (signed nsis, ${{ matrix.arch }})
         if: steps.sign.outputs.signed == 'true'
