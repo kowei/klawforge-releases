@@ -250,5 +250,8 @@ jobs:
             # 用 CHANGELOG 刷新 notes(蓋過罐頭 / 他平台先建的 generic;changelog 為單一事實源)
             [ -s RELEASE_NOTES.md ] && gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --notes-file RELEASE_NOTES.md
           else
-            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "Klawforge ${VER}" "${notes_args[@]}" "${assets[@]}"
+            # RELEASE-WINDOWS-UPDATE-GAP-001:--latest=false 建立,不搶標 Latest。
+            # 全平台齊了由 OpenKlaw scripts/release-all.sh 最後一次 gh release edit --latest,
+            # 消除「某平台先建 release + 翻 Latest 但 latest.json 只有自己 → 他平台 ~15min 更新空窗」。
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --latest=false --title "Klawforge ${VER}" "${notes_args[@]}" "${assets[@]}"
           fi
