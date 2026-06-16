@@ -217,7 +217,10 @@ jobs:
 
           # 只有 signed(有 .sig)才動 latest.json 線上更新源;unsigned 跳過(手動裝)。
           if [ -f "out/${x64}.sig" ] && [ -f "out/${arm}.sig" ]; then
-            if curl -fsSL "https://github.com/${REPO}/releases/latest/download/latest.json" -o cur.json; then
+            # 抓「同一個 tag 自己」的 latest.json 當底(mac 端可能已上傳含 darwin)。
+            # 絕不可抓 /releases/latest/:發新版當下 Latest 仍釘舊版 → cur_ver≠VER → 空底
+            # 把對方平台(darwin-*)洗掉。RELEASE-LATEST-JSON-MERGE-DROPS-DARWIN-001(rc.116→rc.120 重犯)。
+            if curl -fsSL "https://github.com/${REPO}/releases/download/${TAG}/latest.json" -o cur.json; then
               cur_ver="$(jq -r '.version // ""' cur.json)"
               if [ "$cur_ver" = "$VER" ]; then keep=cur.json; else echo '{}' > keep.json; keep=keep.json; fi
             else
